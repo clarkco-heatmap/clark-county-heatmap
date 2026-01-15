@@ -3,7 +3,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Clark County Building Age – True Heatmap</title>
+  <title>Clark County Building Age Heatmap + Footprints + Timeline</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
   https://js.arcgis.com/4.30/esri/themes/light/main.css
@@ -14,23 +14,26 @@
       height: 100%; width: 100%; margin: 0; padding: 0;
       font-family: system-ui, sans-serif;
     }
-    .legendBox {
-      position: absolute; bottom: 16px; left: 16px;
-      background: rgba(255,255,255,0.92);
-      padding: 10px 14px; border-radius: 6px;
-      box-shadow: 0 1px 6px rgba(0,0,0,0.25);
-      font-size: 13px;
+    .panel {
+      position: absolute;
+      top: 15px;
+      left: 15px;
+      z-index: 5;
+      background: rgba(255,255,255,0.9);
+      padding: 10px 14px;
+      border-radius: 6px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.2);
     }
   </style>
 </head>
-<body>
 
+<body>
 <div id="viewDiv"></div>
 
-<div class="legendBox">
-  <strong>Heatmap Colors</strong><br>
-  Older buildings = <span style="color:#ff0000;font-weight:bold">hot (red)</span><br>
-  Newer buildings = <span style="color:#00c6ff;font-weight:bold">cold (blue)</span>
+<div class="panel">
+  <strong>Timeline:</strong><br>
+  <input id="yearSlider" type="range" min="1900" max="2025" value="2025" style="width:220px;">
+  <span id="yearLabel">2025</span>
 </div>
 
 <script>
@@ -40,44 +43,168 @@ require([
   "esri/layers/FeatureLayer",
   "esri/layers/GraphicsLayer",
   "esri/Graphic",
-  "esri/renderers/HeatmapRenderer"
-], (
-  Map, MapView, FeatureLayer, GraphicsLayer, Graphic, HeatmapRenderer
-) => {
+  "esri/geometry/geometryEngine"
+], function(
+  Map, MapView, FeatureLayer, GraphicsLayer, Graphic, geometryEngine
+) {
 
+  // -----------------------------
+  // 1. Data Sources (Clark County)
+  // -----------------------------
   const parcelUrl =
     "https://gis.clark.wa.gov/arcgisfed/rest/services/ClarkView_Public/TaxlotsPublic/MapServer/0";
 
-  const layer = new FeatureLayer({
-    url: parcelUrl,
-    outFields: ["BldgYrBlt"],
-    minScale: 0
-  });
+  const footprintsUrl =
+    "https://gis.clark.wa.gov/arcgisfed/rest/services/ClarkView_Public/BuildingFootprints/MapServer/0";
 
-  const heatLayer = new GraphicsLayer();
+
+  // -----------------------------------------
+  // 2. Layer containers (footprints + points)
+  // -----------------------------------------
+  const parcelPointsLayer = new GraphicsLayer();
+  const joinedFootprintsLayer = new GraphicsLayer();
 
   const map = new Map({
     basemap: "gray-vector",
-    layers: [heatLayer]
+    layers: [joinedFootprintsLayer, parcelPointsLayer]
   });
 
   const view = new MapView({
     container: "viewDiv",
     map,
     center: [-122.52, 45.78],
-    zoom: 10
+    zoom: 11
   });
 
-  async function fetchAllFeatures() {
-    const pageSize = 1000;
-    let offset = 0;
-    let all = [];
-    let finished = false;
 
-    while (!finished) {
+  // -----------------------------------------
+  // 3. Function to page through parcels safely
+  // -----------------------------------------
+  async function fetchAllParcels(layer) {
+    let results = [];
+    let start = 0;
+    const page = 1000;
+
+    while (true) {
       const res = await layer.queryFeatures({
         where: "BldgYrBlt IS NOT NULL AND BldgYrBlt > 0",
-        outFields: ["BldgYrBlt"],
+        outFields: ["BldgYrBlt", "BldgEffYrBlt", "SitusAddrs", "BldgSqft", "BldgCount"],
         returnGeometry: true,
-        num: pageSize,
-        start: offset,
+        num: page,
+        start: start
+      });
+
+      results.push(...res.features);
+      if (res.features.length < page) break;
+      start += page;
+    }
+    return results;
+  }
+
+
+  // ------------------------------
+  // 4. Load Parcels + Footprints
+  // ------------------------------
+  const parcelLayer = new FeatureLayer({ url: parcelUrl, minScale: 0 });
+  const footprintLayer = new FeatureLayer({ url: footprintsUrl, minScale: 0 });
+
+  Promise.all([
+    fetchAllParcels(parcelLayer),
+    footprintLayer.queryFeatures({ where: "1=1", returnGeometry: true })
+  ]).then(([parcels, footprints]) => {
+
+    // --------------------------------------------------------
+    // 5. Build spatial index of parcels → faster lookup
+    // --------------------------------------------------------
+    const parcelIndex = parcels.map(p => ({
+      geom: p.geometry,
+      attrs: p.attributes
+    }));
+
+    // --------------------------------------------------------
+    // 6. JOIN: For each building footprint → find parcel
+    // --------------------------------------------------------
+    footprints.features.forEach(fp => {
+      const fpGeom = fp.geometry;
+
+      const ownerParcel = parcelIndex.find(pr =>
+        geometryEngine.within(fpGeom, pr.geom)
+      );
+
+      if (ownerParcel) {
+        const { BldgYrBlt, BldgEffYrBlt, SitusAddrs, BldgSqft, BldgCount } =
+          ownerParcel.attrs;
+
+        joinedFootprintsLayer.add(new Graphic({
+          geometry: fpGeom,
+          attributes: {
+            year: BldgYrBlt,
+            effective: BldgEffYrBlt,
+            address: SitusAddrs,
+            sqft: BldgSqft,
+            count: BldgCount
+          },
+          symbol: {
+            type: "simple-fill",
+            color: [255, 0, 0, 0.15],
+            outline: { color: [255, 0, 0, 0.4], width: 0.4 }
+          }
+        }));
+      }
+    });
+
+
+    // --------------------------------------------------------
+    // 7. Create centroid points for heatmap / popup
+    // --------------------------------------------------------
+    parcels.forEach(p => {
+      const centroid = p.geometry.centroid;
+      const yr = p.attributes.BldgYrBlt;
+      const eff = p.attributes.BldgEffYrBlt;
+
+      parcelPointsLayer.add(new Graphic({
+        geometry: centroid,
+        attributes: p.attributes,
+        symbol: {
+          type: "simple-marker",
+          color: [255,0,0,0],  // invisible but clickable
+          size: 8
+        },
+        popupTemplate: {
+          title: "{SitusAddrs}",
+          content: `
+            <b>Year Built:</b> ${yr}<br>
+            <b>Effective:</b> ${eff}<br>
+            <b>Sq Ft:</b> {BldgSqft}<br>
+            <b>Structures:</b> {BldgCount}<br>
+            <b>Age:</b> ${new Date().getFullYear() - yr} years
+          `
+        }
+      }));
+    });
+
+
+    // --------------------------------------------------------
+    // 8. Time Slider Filtering (1900–2025)
+    // --------------------------------------------------------
+    const slider = document.getElementById("yearSlider");
+    const label = document.getElementById("yearLabel");
+
+    slider.oninput = () => {
+      const year = +slider.value;
+      label.textContent = year;
+
+      joinedFootprintsLayer.graphics.forEach(g => {
+        g.visible = (g.attributes.year <= year);
+      });
+    };
+
+    slider.oninput();
+
+  });
+
+});
+</script>
+
+</body>
+</html>
