@@ -1,0 +1,394 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Clark County Building Age – Heatmap + Footprints + Timeline</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- ArcGIS Maps SDK 4.30: CSS + JS -->
+  <link rel="stylesheet" href="https://js.arcgis.com/4.30/esri/themes/light/main.css" />
+  <script src="https://js.arcgis.com/4.30/"></script>
+
+  <style>
+    html, body, #viewDiv { height:100%; width:100%; margin:0; padding:0; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    .panel {
+      position: absolute; top: 14px; left: 14px; z-index: 10;
+      background: rgba(255,255,255,0.92); border-radius: 8px;
+      padding: 10px 12px; box-shadow: 0 2px 8px rgba(0,0,0,.18);
+      max-width: 290px;
+    }
+    .panel h3 { margin: 0 0 6px; font-size: 16px; }
+    .row { margin: 4px 0; }
+    .row label { cursor: pointer; }
+    .footer {
+      position: absolute; left: 14px; bottom: 10px; z-index: 9;
+      background: rgba(255,255,255,0.92); padding: 8px 10px; border-radius: 6px;
+      box-shadow: 0 2px 6px rgba(0,0,0,.15); font-size: 12px;
+    }
+    .busy {
+      position: absolute; right: 14px; top: 14px; z-index: 11;
+      background: rgba(0,0,0,.75); color: #fff; padding: 8px 10px;
+      border-radius: 6px; font-size: 12px; display: none;
+    }
+  </style>
+</head>
+<body>
+
+<div id="viewDiv"></div>
+
+<!-- Controls -->
+<div class="panel">
+  <h3>Map Layers</h3>
+  <div class="row"><label><input id="tgHeat" type="checkbox" checked> Heatmap (older = hot)</label></div>
+  <div class="row"><label><input id="tgParcels" type="checkbox"> Parcel points (click for details)</label></div>
+  <div class="row"><label><input id="tgFootprints" type="checkbox"> Building footprints (joined Year Built)</label></div>
+  <hr>
+  <h3>Timeline</h3>
+  <div class="row">
+    <input id="yearSlider" type="range" min="1900" max="2025" value="2025" style="width:220px;">
+    <span id="yearLabel" style="display:inline-block; min-width:44px; text-align:right;">2025</span>
+  </div>
+  <div class="row"><label><input id="tgTimeline" type="checkbox"> Enable timeline filter (≤ selected year)</label></div>
+</div>
+
+<!-- Status -->
+<div class="busy" id="busy">Loading data…</div>
+
+<!-- Legend -->
+<div class="footer">
+  <b>Heatmap colors:</b> <span style="color:#007fff">new (cold)</span> → <span style="color:#ff0000">old (hot)</span><br>
+  Data: Clark County WA — TaxlotsPublic & BuildingFootprints (live services). 
+</div>
+
+<script>
+require([
+  "esri/Map",
+  "esri/views/MapView",
+  "esri/layers/FeatureLayer",
+  "esri/Graphic",
+  "esri/geometry/geometryEngine",
+  "esri/rest/support/Query",
+  "esri/renderers/HeatmapRenderer",
+  "esri/layers/support/Field",
+  "esri/geometry/Extent"
+], function (
+  Map, MapView, FeatureLayer, Graphic, geometryEngine, Query, HeatmapRenderer, Field, Extent
+) {
+  // -----------------------------
+  // Clark County live services
+  // -----------------------------
+  const PARCELS_URL =
+    "https://gis.clark.wa.gov/arcgisfed/rest/services/ClarkView_Public/TaxlotsPublic/MapServer/0";
+  const FOOTPRINTS_URL =
+    "https://gis.clark.wa.gov/arcgisfed/rest/services/ClarkView_Public/BuildingFootprints/MapServer/0";
+  // Docs / items: TaxlotsPublic (has BldgYrBlt) & BuildingFootprints. 
+  // Sources: https://www.arcgis.com/home/item.html?id=d8c5df2e3c4540bea23a9b2f04493a89 , https://gis.clark.wa.gov/arcgisfed/rest/services/ClarkView_Public/BuildingFootprints/MapServer
+  // (Older = hot) per your requirement.
+
+  // -----------------------------
+  // UI elements
+  // -----------------------------
+  const elHeat = document.getElementById("tgHeat");
+  const elParcels = document.getElementById("tgParcels");
+  const elFoot = document.getElementById("tgFootprints");
+  const elSlider = document.getElementById("yearSlider");
+  const elLabel = document.getElementById("yearLabel");
+  const elTimeline = document.getElementById("tgTimeline");
+  const elBusy = document.getElementById("busy");
+
+  // -----------------------------
+  // Base map + view
+  // -----------------------------
+  const map = new Map({ basemap: "gray-vector" });
+  const view = new MapView({
+    container: "viewDiv",
+    map,
+    center: [-122.52, 45.78],
+    zoom: 11
+  });
+
+  // -----------------------------
+  // Live feature layers (server)
+  // -----------------------------
+  const srvParcels = new FeatureLayer({ url: PARCELS_URL, minScale: 0 });
+  const srvFoot = new FeatureLayer({ url: FOOTPRINTS_URL, minScale: 0 });
+
+  // -----------------------------
+  // Client-side layers we control
+  // (FeatureLayer with in-memory "source")
+  // -----------------------------
+  // Heatmap points (parcel centroids with age)
+  const heatLayer = new FeatureLayer({
+    title: "Heatmap (parcel centroids)",
+    fields: [
+      new Field({ name: "ObjectID", type: "oid" }),
+      new Field({ name: "year", type: "integer" }),
+      new Field({ name: "age", type: "integer" }),
+      new Field({ name: "addr", type: "string" }),
+      new Field({ name: "sqft", type: "integer" }),
+      new Field({ name: "cnt", type: "integer" })
+    ],
+    objectIdField: "ObjectID",
+    geometryType: "point",
+    spatialReference: { wkid: 102100 },
+    source: [], // fill dynamically
+    renderer: new HeatmapRenderer({
+      field: "age",
+      colorStops: [
+        { ratio: 0.00, color: "rgba(0, 200, 255, 0)" },
+        { ratio: 0.20, color: "rgba(0, 200, 255, 0.85)" },
+        { ratio: 0.40, color: "rgba(0, 120, 255, 0.95)" },
+        { ratio: 0.60, color: "rgba(255, 140,   0, 0.95)" },
+        { ratio: 0.80, color: "rgba(255,  60,   0, 1.00)" },
+        { ratio: 1.00, color: "rgba(255,   0,   0, 1.00)" }
+      ],
+      minPixelIntensity: 1,
+      maxPixelIntensity: 50
+    }),
+    popupEnabled: false,
+    visible: true
+  });
+
+  // Parcel points (clickable markers with popup)
+  const parcelPoints = new FeatureLayer({
+    title: "Parcel points (clickable)",
+    fields: heatLayer.fields.toArray(), // same schema: year/age/addr/sqft/cnt
+    objectIdField: "ObjectID",
+    geometryType: "point",
+    spatialReference: { wkid: 102100 },
+    source: [],
+    renderer: {
+      type: "simple",
+      symbol: { type: "simple-marker", color: [255, 255, 255, 0], size: 6, outline: { color: [255, 0, 0, 0.4], width: 0.5 } }
+    },
+    popupTemplate: {
+      title: "{addr}",
+      content: (f) => {
+        const y = f.graphic.attributes.year;
+        const a = f.graphic.attributes.age;
+        const s = f.graphic.attributes.sqft ?? "-";
+        const c = f.graphic.attributes.cnt ?? "-";
+        return `
+          <b>Year Built:</b> ${y}<br/>
+          <b>Age:</b> ${a} years<br/>
+          <b>Sq Ft:</b> ${s}<br/>
+          <b>Structures:</b> ${c}
+        `;
+      }
+    },
+    visible: false
+  });
+
+  // Footprints joined with Year Built (polygon layer with popup)
+  const joinedFootprints = new FeatureLayer({
+    title: "Footprints (with Year Built)",
+    fields: [
+      new Field({ name: "ObjectID", type: "oid" }),
+      new Field({ name: "year", type: "integer" }),
+      new Field({ name: "effective", type: "integer" }),
+      new Field({ name: "addr", type: "string" }),
+      new Field({ name: "sqft", type: "integer" }),
+      new Field({ name: "cnt", type: "integer" })
+    ],
+    objectIdField: "ObjectID",
+    geometryType: "polygon",
+    spatialReference: { wkid: 102100 },
+    source: [],
+    renderer: {
+      type: "simple",
+      symbol: { type: "simple-fill", color: [255, 0, 0, 0.12], outline: { color: [255, 0, 0, 0.5], width: 0.4 } }
+    },
+    popupTemplate: {
+      title: "{addr}",
+      content: (f) => {
+        const at = f.graphic.attributes;
+        const yr = at.year ?? "—";
+        const eff = at.effective ?? "—";
+        const s = at.sqft ?? "—";
+        const c = at.cnt ?? "—";
+        return `
+          <b>Year Built:</b> ${yr}<br/>
+          <b>Effective Year:</b> ${eff}<br/>
+          <b>Sq Ft:</b> ${s}<br/>
+          <b>Structures on parcel:</b> ${c}
+        `;
+      }
+    },
+    visible: false
+  });
+
+  map.addMany([joinedFootprints, parcelPoints, heatLayer]); // draw order
+
+  // -----------------------------
+  // Helpers
+  // -----------------------------
+  function showBusy(on) { elBusy.style.display = on ? "block" : "none"; }
+
+  // Paged query helper (reliable against server limits)
+  async function queryAll(layer, opts, max = 20000) {
+    const out = [];
+    let offset = 0;
+    const page = 2000; // server default MaxRecordCount ≈ 2000
+    let more = true;
+    while (more) {
+      const q = layer.createQuery();
+      Object.assign(q, opts);
+      q.outFields = opts.outFields || ["*"];
+      q.returnGeometry = (opts.returnGeometry !== false);
+      q.resultOffset = offset;
+      q.resultRecordCount = page;
+
+      const res = await layer.queryFeatures(q);
+      out.push(...res.features);
+      if (res.features.length < page || out.length >= max) {
+        more = false;
+      } else {
+        offset += page;
+      }
+    }
+    return out;
+  }
+
+  // Extent-buffer helper (query slightly beyond the screen)
+  function bufferedExtent(ext) {
+    const dx = (ext.xmax - ext.xmin) * 0.2;
+    const dy = (ext.ymax - ext.ymin) * 0.2;
+    return new Extent({
+      xmin: ext.xmin - dx, xmax: ext.xmax + dx,
+      ymin: ext.ymin - dy, ymax: ext.ymax + dy,
+      spatialReference: ext.spatialReference
+    });
+  }
+
+  // Update definitionExpression when timeline is enabled
+  function applyTimelineFilter() {
+    const yr = +elSlider.value;
+    elLabel.textContent = yr;
+    const expr = elTimeline.checked ? `year <= ${yr}` : "1=1";
+    heatLayer.definitionExpression = expr;
+    parcelPoints.definitionExpression = expr;
+    joinedFootprints.definitionExpression = expr;
+  }
+
+  // -----------------------------
+  // Core: load data for current view
+  //  - Heatmap & parcel points: parcel centroids from TaxlotsPublic (within extent)
+  //  - Footprints: join to parcels for the same extent (client-side)
+  // -----------------------------
+  let loadingToken = 0;
+  async function updateForExtent() {
+    const myToken = ++loadingToken;
+    showBusy(true);
+
+    try {
+      const extent = bufferedExtent(view.extent);
+
+      // 1) Load parcels in extent (with year built)
+      const parcelOpts = {
+        geometry: extent, spatialRelationship: "intersects",
+        where: "BldgYrBlt IS NOT NULL AND BldgYrBlt > 0",
+        outFields: ["BldgYrBlt","BldgEffYrBlt","SitusAddrs","BldgSqft","BldgCount"],
+        returnGeometry: true
+      };
+      const parcels = await queryAll(srvParcels, parcelOpts, /*max*/ 20000);
+
+      // Build a local spatial set for join (array is okay at view scale)
+      // Also, build the heat + points layers from parcel centroids
+      const heatSource = [];
+      const ptsSource = [];
+      let oid = 1;
+      const nowYear = (new Date()).getFullYear();
+
+      for (const p of parcels) {
+        const cent = p.geometry.centroid;
+        const y = p.attributes.BldgYrBlt;
+        const a = nowYear - y;
+
+        const attrs = {
+          ObjectID: oid++,
+          year: y,
+          age: a,
+          addr: p.attributes.SitusAddrs,
+          sqft: p.attributes.BldgSqft,
+          cnt: p.attributes.BldgCount
+        };
+
+        heatSource.push(new Graphic({ geometry: cent, attributes: attrs }));
+        ptsSource.push(new Graphic({ geometry: cent, attributes: attrs }));
+      }
+
+      // 2) Load footprints for same extent, then join to parcel set in client
+      // (First, fetch footprints; then associate each with parcel by within())
+      const footOpts = {
+        geometry: extent, spatialRelationship: "intersects",
+        returnGeometry: true, outFields: []
+      };
+      const footprints = await queryAll(srvFoot, footOpts, /*max*/ 12000); // cap for perf
+
+      // Prepare a quick subset of parcels (geom + attrs) for join
+      const pJoin = parcels.map(p => ({
+        g: p.geometry, a: p.attributes
+      }));
+
+      const fpSource = [];
+      for (const fp of footprints) {
+        // Find first parcel whose geometry contains the footprint centroid (faster than polygon-within)
+        const c = fp.geometry.centroid;
+        const parcel = pJoin.find(pr => geometryEngine.contains(pr.g, c));
+        if (!parcel) continue;
+
+        const attrs = {
+          ObjectID: fpSource.length + 1,
+          year: parcel.a.BldgYrBlt,
+          effective: parcel.a.BldgEffYrBlt,
+          addr: parcel.a.SitusAddrs,
+          sqft: parcel.a.BldgSqft,
+          cnt: parcel.a.BldgCount
+        };
+        fpSource.push(new Graphic({ geometry: fp.geometry, attributes: attrs }));
+      }
+
+      // If another call started after this one, drop this result (prevents flicker)
+      if (myToken !== loadingToken) return;
+
+      // Update client layers
+      heatLayer.source.removeAll(); heatLayer.source.addMany(heatSource);
+      parcelPoints.source.removeAll(); parcelPoints.source.addMany(ptsSource);
+      joinedFootprints.source.removeAll(); joinedFootprints.source.addMany(fpSource);
+
+      applyTimelineFilter(); // reapplies definitionExpression
+
+    } catch (e) {
+      console.error(e);
+      alert("Data load issue. Try zooming in or reloading.");
+    } finally {
+      if (myToken === loadingToken) showBusy(false);
+    }
+  }
+
+  // -----------------------------
+  // Wire up UI interactions
+  // -----------------------------
+  elHeat.addEventListener("change", () => { heatLayer.visible = elHeat.checked; });
+  elParcels.addEventListener("change", () => { parcelPoints.visible = elParcels.checked; });
+  elFoot.addEventListener("change", () => { joinedFootprints.visible = elFoot.checked; });
+
+  elTimeline.addEventListener("change", applyTimelineFilter);
+  elSlider.addEventListener("input", applyTimelineFilter);
+
+  // Refresh data when map is moved (debounced on stationary)
+  let debounce;
+  view.watch("stationary", (st) => {
+    if (!st) return;
+    clearTimeout(debounce);
+    debounce = setTimeout(updateForExtent, 200);
+  });
+
+  // Initial load
+  view.when(updateForExtent);
+});
+</script>
+</body>
+</html>
